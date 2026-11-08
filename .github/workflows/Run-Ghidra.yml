@@ -63,15 +63,22 @@ jobs:
         working-directory: extension
         run: gradle buildExtension
 
-      - name: Locate extension jar
+      - name: Install extensions into Ghidra
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/ext"
-          unzip -q -o extension/dist/*.zip -d "$RUNNER_TEMP/ext"
-          jar="$(find "$RUNNER_TEMP/ext" -name GhidraMCP.jar | head -n 1)"
-          test -n "$jar"
-          echo "GHIDRAMCP_JAR=$jar" >> "$GITHUB_ENV"
+          ext_dir="$GHIDRA_INSTALL_DIR/Ghidra/Extensions"
+          # GhidraMCP (built from this repo)
+          unzip -q -o extension/dist/*.zip -d "$ext_dir"
+          # XBE loader (release built for Ghidra 12.1.4)
+          mkdir -p "$RUNNER_TEMP/xbe"
+          gh release download build-202610161023 --repo XboxDev/ghidra-xbe --pattern '*ghidra-xbe.zip' --dir "$RUNNER_TEMP/xbe"
+          unzip -q -o "$RUNNER_TEMP"/xbe/*ghidra-xbe.zip -d "$ext_dir"
+          chmod +x "$ext_dir"/ghidra-xbe/os/linux_x86_64/XbSymbolDatabaseCLI || true
+          echo "Installed extensions:"
+          ls "$ext_dir"
 
       - name: Fetch target binary
         env:
@@ -121,7 +128,6 @@ jobs:
           mkdir -p artifacts
           nohup uv run --extra headless ghidra-mcp \
             --headless --binary "$TARGET_BINARY" \
-            --extension-jar "$GHIDRAMCP_JAR" \
             --transport streamable-http \
             --mcp-host 0.0.0.0 --mcp-port "$MCP_PORT" \
             --ready-timeout 120 \
@@ -133,7 +139,7 @@ jobs:
             sleep 2
           done
           # 2) wait until Ghidra has finished importing and analyzing
-          for i in {1..600}; do
+          for i in {1..1800}; do
             if grep -Eq 'Serving .+ on http://127\.0\.0\.1:[0-9]+/$' artifacts/ghidra-mcp.log; then
               echo "Ghidra finished loading and analysis"
               tail -n 5 artifacts/ghidra-mcp.log
