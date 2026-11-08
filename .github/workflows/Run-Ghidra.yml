@@ -13,6 +13,11 @@ on:
         required: false
         type: string
         default: ""
+      ps2recomp:
+        description: PS2 ELF only - run the PS2Recomp pipeline (Ghidra export, build, recompile) before starting the MCP server.
+        required: true
+        type: boolean
+        default: false
       duration_minutes:
         description: How long to keep it alive (5-330).
         required: true
@@ -35,6 +40,7 @@ jobs:
       GHIDRA_VERSION: 12.1.4
       GHIDRA_DATE: 20260921
       MCP_PORT: "8081"
+      PS2RECOMP_SHA: e5636981a1c9de368f6b71e819c3dc188dfedbf4
 
     steps:
       - uses: actions/checkout@v4
@@ -55,7 +61,7 @@ jobs:
 
       - name: Download Ghidra
         run: |
-          wget --no-verbose -O ghidra.zip https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_DATE}.zip
+          wget --no-verbose --tries=5 --waitretry=10 --retry-connrefused --timeout=60 -O ghidra.zip https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_DATE}.zip
           7z x -bd ghidra.zip
           echo "GHIDRA_INSTALL_DIR=$PWD/ghidra_${GHIDRA_VERSION}_PUBLIC" >> "$GITHUB_ENV"
 
@@ -72,11 +78,16 @@ jobs:
           ext_dir="$GHIDRA_INSTALL_DIR/Ghidra/Extensions"
           # GhidraMCP (built from this repo)
           unzip -q -o extension/dist/*.zip -d "$ext_dir"
-          # XBE loader (release built for Ghidra 12.1.4)
+          # XBE loader (Xbox)
           mkdir -p "$RUNNER_TEMP/xbe"
           gh release download build-202610161023 --repo XboxDev/ghidra-xbe --pattern '*ghidra-xbe.zip' --dir "$RUNNER_TEMP/xbe"
           unzip -q -o "$RUNNER_TEMP"/xbe/*ghidra-xbe.zip -d "$ext_dir"
           chmod +x "$ext_dir"/ghidra-xbe/os/linux_x86_64/XbSymbolDatabaseCLI || true
+          # PS2 Emotion Engine support
+          mkdir -p "$RUNNER_TEMP/ee"
+          gh release download v2.1.39 --repo chaoticgd/ghidra-emotionengine-reloaded --pattern "ghidra_${GHIDRA_VERSION}_*ghidra-emotionengine-reloaded.zip" --dir "$RUNNER_TEMP/ee"
+          unzip -q -o "$RUNNER_TEMP"/ee/*.zip -d "$ext_dir"
+          find "$ext_dir/ghidra-emotionengine-reloaded" -path '*/os/*' -type f -exec chmod +x {} + || true
           echo "Installed extensions:"
           ls "$ext_dir"
 
@@ -121,6 +132,68 @@ jobs:
           fi
           echo "TARGET_BINARY=$target" >> "$GITHUB_ENV"
 
+      - name: Get PS2Recomp
+        if: ${{ inputs.ps2recomp }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --recurse-submodules https://github.com/ran-j/PS2Recomp.git "$RUNNER_TEMP/PS2Recomp"
+          git -C "$RUNNER_TEMP/PS2Recomp" checkout "$PS2RECOMP_SHA"
+          git -C "$RUNNER_TEMP/PS2Recomp" submodule update --init --recursive
+
+      - name: Ghidra analysis and PS2Recomp export
+        if: ${{ inputs.ps2recomp }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts ps2out "$RUNNER_TEMP/ghidra-proj" "$RUNNER_TEMP/ghidra-scripts"
+          src="$RUNNER_TEMP/PS2Recomp/ps2xRecomp/tools/ghidra/ExportPS2Functions.java"
+          dst="$RUNNER_TEMP/ghidra-scripts/ExportPS2Functions.java"
+          # The script uses askFile(), which doesn't work headless: read the paths from script args instead.
+          sed -e 's|askFile("Choose output TOML config file", "Save")|new File(getScriptArgs()[0])|' \
+              -e 's|askFile("Choose output CSV file", "Save")|new File(getScriptArgs()[1])|' \
+              "$src" > "$dst"
+          test "$(grep -c 'getScriptArgs()' "$dst")" -eq 2
+          "$GHIDRA_INSTALL_DIR/support/analyzeHeadless" "$RUNNER_TEMP/ghidra-proj" mcp \
+            -import "$TARGET_BINARY" \
+            -scriptPath "$RUNNER_TEMP/ghidra-scripts" \
+            -postScript ExportPS2Functions.java "$GITHUB_WORKSPACE/ps2out/config.toml" "$GITHUB_WORKSPACE/ps2out/functions.csv" \
+            2>&1 | tee artifacts/ghidra-export.log
+          test -s ps2out/config.toml
+          test -s ps2out/functions.csv
+          echo "Export done:"
+          ls -la ps2out
+
+      - name: Build and run PS2Recomp
+        if: ${{ inputs.ps2recomp }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s ps2out/config.toml
+          cd "$RUNNER_TEMP/PS2Recomp"
+          cmake -S . -B out/build -DCMAKE_BUILD_TYPE=Release \
+            -DPS2X_BUILD_RUNTIME=OFF -DPS2X_BUILD_ANALYZER=OFF \
+            -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF
+          cmake --build out/build --config Release -j"$(nproc)"
+          bin="$(find "$PWD/out/build" -type f -name ps2_recomp | head -n 1)"
+          test -n "$bin"
+          cd "$GITHUB_WORKSPACE/ps2out"
+          "$bin" config.toml 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/ps2recomp.log"
+          echo "Recompiled output:"
+          du -sh output || true
+
+      - name: Upload PS2Recomp output
+        if: ${{ inputs.ps2recomp && !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ps2recomp-output-${{ github.run_id }}
+          path: ps2out
+          retention-days: 3
+          if-no-files-found: ignore
+
       - name: Start Ghidra MCP (headless)
         shell: bash
         run: |
@@ -128,6 +201,7 @@ jobs:
           mkdir -p artifacts
           nohup uv run --extra headless ghidra-mcp \
             --headless --binary "$TARGET_BINARY" \
+            --project "$RUNNER_TEMP/ghidra-proj" --project-name mcp \
             --transport streamable-http \
             --mcp-host 0.0.0.0 --mcp-port "$MCP_PORT" \
             --ready-timeout 120 \
