@@ -101,7 +101,7 @@ jobs:
             --headless --binary "$TARGET_BINARY" \
             --extension-jar "$GHIDRAMCP_JAR" \
             --transport streamable-http \
-            --mcp-host 127.0.0.1 --mcp-port "$MCP_PORT" \
+            --mcp-host 0.0.0.0 --mcp-port "$MCP_PORT" \
             > artifacts/ghidra-mcp.log 2>&1 &
           for _ in {1..120}; do
             code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$MCP_PORT/mcp" || true)"
