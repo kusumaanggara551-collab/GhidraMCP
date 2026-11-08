@@ -102,12 +102,28 @@ jobs:
             --extension-jar "$GHIDRAMCP_JAR" \
             --transport streamable-http \
             --mcp-host 0.0.0.0 --mcp-port "$MCP_PORT" \
+            --ready-timeout 120 \
             > artifacts/ghidra-mcp.log 2>&1 &
+          # 1) wait for the HTTP server to come up
           for _ in {1..120}; do
             code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$MCP_PORT/mcp" || true)"
-            if [[ "$code" != "000" ]]; then
-              echo "Ghidra MCP is up (HTTP $code)"
+            if [[ "$code" != "000" ]]; then break; fi
+            sleep 2
+          done
+          # 2) wait until Ghidra has finished importing and analyzing
+          for i in {1..600}; do
+            if grep -Eq 'Serving .+ on http://127\.0\.0\.1:[0-9]+/$' artifacts/ghidra-mcp.log; then
+              echo "Ghidra finished loading and analysis"
+              tail -n 5 artifacts/ghidra-mcp.log
               exit 0
+            fi
+            if grep -q 'Headless startup failed' artifacts/ghidra-mcp.log; then
+              cat artifacts/ghidra-mcp.log
+              exit 1
+            fi
+            if (( i % 15 == 0 )); then
+              echo "still loading..."
+              tail -n 2 artifacts/ghidra-mcp.log
             fi
             sleep 2
           done
