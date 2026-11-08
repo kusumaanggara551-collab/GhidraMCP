@@ -87,8 +87,8 @@ jobs:
             target="$GITHUB_WORKSPACE/$BINARY_PATH"
             test -f "$target"
           else
-            echo "Provide binary_url or binary_path" >&2
-            exit 1
+            echo "No binary given, using /usr/bin/ls as a test target"
+            target=/usr/bin/ls
           fi
           echo "TARGET_BINARY=$target" >> "$GITHUB_ENV"
 
