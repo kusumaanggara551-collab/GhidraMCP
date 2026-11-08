@@ -87,8 +87,30 @@ jobs:
             target="$GITHUB_WORKSPACE/$BINARY_PATH"
             test -f "$target"
           else
-            echo "No binary given, using /usr/bin/ls as a test target"
-            target=/usr/bin/ls
+            echo "No binary given, compiling a small demo program"
+            cat > "$RUNNER_TEMP/demo.c" <<'EOF'
+          #include <stdio.h>
+          #include <string.h>
+
+          static int check_pin(const char *s) {
+              return strcmp(s, "1337") == 0;
+          }
+
+          int add(int a, int b) {
+              return a + b;
+          }
+
+          int main(int argc, char **argv) {
+              if (argc > 1 && check_pin(argv[1])) {
+                  puts("access granted");
+                  return add(1, 2);
+              }
+              puts("access denied");
+              return 0;
+          }
+          EOF
+            gcc -O0 -o "$RUNNER_TEMP/demo" "$RUNNER_TEMP/demo.c"
+            target="$RUNNER_TEMP/demo"
           fi
           echo "TARGET_BINARY=$target" >> "$GITHUB_ENV"
 
