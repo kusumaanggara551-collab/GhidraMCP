@@ -1,0 +1,90 @@
+name: build-android
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Run ID of the run-ghidra-mcp run that made the ps2recomp-output artifact.
+        required: true
+        type: string
+        default: "42531082532"
+      boot_elf:
+        description: File name of the game ELF on the phone (inside the app files folder).
+        required: true
+        type: string
+        default: "game.elf"
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  PS2RECOMP_SHA: e5636981a1c9de368f6b71e819c3dc188dfedbf4
+
+jobs:
+  apk:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Download recompiled output
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name "ps2recomp-output-$RUN_ID" --dir "$RUNNER_TEMP/gen"
+          echo "cpp files: $(find "$RUNNER_TEMP/gen" -name '*.cpp' | wc -l)"
+          echo "other files:"
+          find "$RUNNER_TEMP/gen" -type f ! -name '*.cpp' | head -n 20
+
+      - name: Get PS2Recomp (same version as the export)
+        run: |
+          set -euo pipefail
+          git clone --recurse-submodules https://github.com/ran-j/PS2Recomp.git "$RUNNER_TEMP/PS2Recomp"
+          git -C "$RUNNER_TEMP/PS2Recomp" checkout "$PS2RECOMP_SHA"
+          git -C "$RUNNER_TEMP/PS2Recomp" submodule update --init --recursive
+
+      - name: Put generated code into the runtime
+        run: |
+          set -euo pipefail
+          rt="$RUNNER_TEMP/PS2Recomp/ps2xRuntime"
+          find "$RUNNER_TEMP/gen" -name '*.cpp' -print0 | xargs -0 -r cp -t "$rt/src/runner"
+          find "$RUNNER_TEMP/gen" -name '*.h' -print0 | xargs -0 -r cp -t "$rt/include"
+          test -f "$rt/include/ps2_recompiled_functions.h"
+          test -f "$rt/include/ps2_recompiled_stubs.h"
+          echo "runner sources: $(ls "$rt/src/runner" | wc -l)"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Install Android SDK pieces
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "ndk;28.2.13676358" "cmake;3.22.1"
+
+      - name: Build APK (arm64 only)
+        env:
+          BOOT_ELF: ${{ inputs.boot_elf }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/PS2Recomp/android"
+          sed -i "s/abiFilters 'arm64-v8a', 'x86_64'/abiFilters 'arm64-v8a'/" app/build.gradle
+          grep -n abiFilters app/build.gradle
+          gradle assembleRelease --no-daemon --stacktrace \
+            -Pps2xBootElf="/storage/emulated/0/Android/data/com.ps2x.runner/files/${BOOT_ELF}"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ps2-android-apk-${{ github.run_id }}
+          path: ${{ runner.temp }}/PS2Recomp/android/app/build/outputs/apk/release/*.apk
+          retention-days: 3
