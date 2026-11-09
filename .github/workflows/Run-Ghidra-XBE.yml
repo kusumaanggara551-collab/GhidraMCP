@@ -1,0 +1,209 @@
+name: run-ghidra-mcp
+
+on:
+  workflow_dispatch:
+    inputs:
+      binary_url:
+        description: Direct download URL of the binary to analyze (leave blank to use binary_path).
+        required: false
+        type: string
+        default: ""
+      binary_path:
+        description: Path of a binary inside this repo (used only if binary_url is blank).
+        required: false
+        type: string
+        default: ""
+      duration_minutes:
+        description: How long to keep it alive (5-330).
+        required: true
+        type: string
+        default: "120"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: run-ghidra-mcp
+  cancel-in-progress: true
+
+jobs:
+  ghidra:
+    name: Ghidra MCP over Cloudflare tunnel
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      GHIDRA_VERSION: 12.1.4
+      GHIDRA_DATE: 20260921
+      MCP_PORT: "8081"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Download Ghidra
+        run: |
+          wget --no-verbose --tries=5 --waitretry=10 --retry-connrefused --timeout=60 -O ghidra.zip https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_DATE}.zip
+          7z x -bd ghidra.zip
+          echo "GHIDRA_INSTALL_DIR=$PWD/ghidra_${GHIDRA_VERSION}_PUBLIC" >> "$GITHUB_ENV"
+
+      - name: Build Ghidra extension
+        working-directory: extension
+        run: gradle buildExtension
+
+      - name: Install extensions into Ghidra
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ext_dir="$GHIDRA_INSTALL_DIR/Ghidra/Extensions"
+          # GhidraMCP (built from this repo)
+          unzip -q -o extension/dist/*.zip -d "$ext_dir"
+          # XBE loader (Xbox)
+          mkdir -p "$RUNNER_TEMP/xbe"
+          gh release download build-202610161023 --repo XboxDev/ghidra-xbe --pattern '*ghidra-xbe.zip' --dir "$RUNNER_TEMP/xbe"
+          unzip -q -o "$RUNNER_TEMP"/xbe/*ghidra-xbe.zip -d "$ext_dir"
+          chmod +x "$ext_dir"/ghidra-xbe/os/linux_x86_64/XbSymbolDatabaseCLI || true
+          echo "Installed extensions:"
+          ls "$ext_dir"
+
+      - name: Fetch target binary
+        env:
+          BINARY_URL: ${{ inputs.binary_url }}
+          BINARY_PATH: ${{ inputs.binary_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "$BINARY_URL" ]]; then
+            curl -fsSL "$BINARY_URL" -o "$RUNNER_TEMP/target.bin"
+            target="$RUNNER_TEMP/target.bin"
+          elif [[ -n "$BINARY_PATH" ]]; then
+            target="$GITHUB_WORKSPACE/$BINARY_PATH"
+            test -f "$target"
+          else
+            echo "No binary given, compiling a small demo program"
+            cat > "$RUNNER_TEMP/demo.c" <<'EOF'
+          #include <stdio.h>
+          #include <string.h>
+
+          static int check_pin(const char *s) {
+              return strcmp(s, "1337") == 0;
+          }
+
+          int add(int a, int b) {
+              return a + b;
+          }
+
+          int main(int argc, char **argv) {
+              if (argc > 1 && check_pin(argv[1])) {
+                  puts("access granted");
+                  return add(1, 2);
+              }
+              puts("access denied");
+              return 0;
+          }
+          EOF
+            gcc -O0 -o "$RUNNER_TEMP/demo" "$RUNNER_TEMP/demo.c"
+            target="$RUNNER_TEMP/demo"
+          fi
+          echo "TARGET_BINARY=$target" >> "$GITHUB_ENV"
+
+      - name: Start Ghidra MCP (headless)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts "$RUNNER_TEMP/ghidra-proj"
+          nohup uv run --extra headless ghidra-mcp \
+            --headless --binary "$TARGET_BINARY" \
+            --project "$RUNNER_TEMP/ghidra-proj" --project-name mcp \
+            --transport streamable-http \
+            --mcp-host 0.0.0.0 --mcp-port "$MCP_PORT" \
+            --ready-timeout 120 \
+            > artifacts/ghidra-mcp.log 2>&1 &
+          # 1) wait for the HTTP server to come up
+          for _ in {1..120}; do
+            code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$MCP_PORT/mcp" || true)"
+            if [[ "$code" != "000" ]]; then break; fi
+            sleep 2
+          done
+          # 2) wait until Ghidra has finished importing and analyzing
+          for i in {1..1800}; do
+            if grep -Eq 'Serving .+ on http://127\.0\.0\.1:[0-9]+/$' artifacts/ghidra-mcp.log; then
+              echo "Ghidra finished loading and analysis"
+              tail -n 5 artifacts/ghidra-mcp.log
+              exit 0
+            fi
+            if grep -q 'Headless startup failed' artifacts/ghidra-mcp.log; then
+              cat artifacts/ghidra-mcp.log
+              exit 1
+            fi
+            if (( i % 15 == 0 )); then
+              echo "still loading..."
+              tail -n 2 artifacts/ghidra-mcp.log
+            fi
+            sleep 2
+          done
+          cat artifacts/ghidra-mcp.log
+          exit 1
+
+      - name: Start Cloudflare tunnel
+        id: tunnel
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker rm -f ghidra-mcp-cloudflared >/dev/null 2>&1 || true
+          docker run -d --name ghidra-mcp-cloudflared --network host \
+            cloudflare/cloudflared:latest \
+            tunnel --no-autoupdate --url "http://127.0.0.1:${MCP_PORT}"
+          for _ in {1..60}; do
+            docker logs ghidra-mcp-cloudflared > artifacts/cloudflared.log 2>&1 || true
+            u="$(grep -Eo 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' artifacts/cloudflared.log | head -n 1 || true)"
+            if [[ -n "$u" ]]; then
+              echo "url=$u/mcp" >> "$GITHUB_OUTPUT"
+              echo "Ghidra MCP URL: $u/mcp"
+              {
+                echo "## Ghidra MCP"
+                echo ""
+                echo "- MCP URL: $u/mcp"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 2
+          done
+          cat artifacts/cloudflared.log
+          exit 1
+
+      - name: Keep alive
+        env:
+          DURATION: ${{ inputs.duration_minutes }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$DURATION" =~ ^[0-9]+$ ]] && (( DURATION >= 5 && DURATION <= 330 )) || { echo "duration must be 5-330" >&2; exit 1; }
+          echo "Ghidra MCP live: ${{ steps.tunnel.outputs.url }}"
+          sleep "$(( DURATION * 60 ))"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghidra-mcp-logs-${{ github.run_id }}
+          path: artifacts
+          if-no-files-found: ignore
+
+      - name: Stop
+        if: always()
+        run: docker rm -f ghidra-mcp-cloudflared >/dev/null 2>&1 || true
