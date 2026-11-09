@@ -13,6 +13,16 @@ on:
         required: true
         type: string
         default: "game.elf"
+      app_name:
+        description: App name shown under the icon.
+        required: true
+        type: string
+        default: "Ace Combat 04"
+      touch_controls:
+        description: Add on-screen touch controls.
+        required: true
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -27,6 +37,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download recompiled output
         env:
           GH_TOKEN: ${{ github.token }}
@@ -55,6 +67,14 @@ jobs:
           test -f "$rt/include/ps2_recompiled_stubs.h"
           echo "runner sources: $(ls "$rt/src/runner" | wc -l)"
 
+      - name: Patch app (icon, name, touch controls)
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          TOUCH: ${{ inputs.touch_controls }}
+        run: |
+          set -euo pipefail
+          python3 android-patch/patch_runtime.py "$RUNNER_TEMP/PS2Recomp" "$APP_NAME" "$TOUCH"
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -76,6 +96,8 @@ jobs:
           BOOT_ELF: ${{ inputs.boot_elf }}
         run: |
           set -euo pipefail
+          # Skip link-time optimization to keep the build fast
+          sed -i 's/if(IPO_SUPPORTED)/if(FALSE)/' "$RUNNER_TEMP/PS2Recomp/ps2xRuntime/cmake/ReleaseMode.cmake"
           cd "$RUNNER_TEMP/PS2Recomp/android"
           sed -i "s/abiFilters 'arm64-v8a', 'x86_64'/abiFilters 'arm64-v8a'/" app/build.gradle
           grep -n abiFilters app/build.gradle
